@@ -105,11 +105,13 @@ enum tmp108_hw_id {
 #define P3T1035_CONVRATE_8HZ		(P3T1035_CONF_CR0 | P3T1035_CONF_CR1)
 
 struct tmp108 {
-	struct regmap *regmap;
-	struct regmap *regmap_8;
-	u16 orig_config;
-	unsigned long ready_time;
-	enum tmp108_hw_id hw_id;
+	struct regmap		*regmap;
+	u16			orig_config;
+	unsigned long		ready_time;
+	enum tmp108_hw_id	hw_id;
+	bool			conf_reg_16bits;
+	u8			reg_buf[1];
+	u8			val_buf[3];
 };
 
 /* convert 12-bit TMP108 register value to milliCelsius */
@@ -134,7 +136,7 @@ static int tmp108_read(struct device *dev, enum hwmon_sensor_types type,
 	if (type == hwmon_chip) {
 		if (attr == hwmon_chip_update_interval) {
 			if (tmp108->hw_id == P3T1035_ID) {
-				err = regmap_read(tmp108->regmap_8, TMP108_REG_CONF, &regval);
+				err = regmap_read(tmp108->regmap, TMP108_REG_CONF, &regval);
 				if (err < 0)
 					return err;
 				switch (regval & P3T1035_CONF_CONVRATE_MASK) {
@@ -202,7 +204,7 @@ static int tmp108_read(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_temp_min_alarm:
 	case hwmon_temp_max_alarm:
 		if (tmp108->hw_id == P3T1035_ID) {
-			err = regmap_read(tmp108->regmap_8, TMP108_REG_CONF, &regval);
+			err = regmap_read(tmp108->regmap, TMP108_REG_CONF, &regval);
 			if (err < 0)
 				return err;
 			*temp = !!(regval & (attr == hwmon_temp_min_alarm ?
@@ -270,7 +272,7 @@ static int tmp108_write(struct device *dev, enum hwmon_sensor_types type,
 					mask = P3T1035_CONVRATE_1HZ;
 				else
 					mask = P3T1035_CONVRATE_0P25HZ;
-				return regmap_update_bits(tmp108->regmap_8, TMP108_REG_CONF,
+				return regmap_update_bits(tmp108->regmap, TMP108_REG_CONF,
 							  P3T1035_CONF_CONVRATE_MASK, mask);
 			}
 			if (temp < 156)
@@ -388,10 +390,7 @@ static void tmp108_restore_config(void *data)
 {
 	struct tmp108 *tmp108 = data;
 
-	if (tmp108->hw_id == P3T1035_ID)
-		regmap_write(tmp108->regmap_8, TMP108_REG_CONF, tmp108->orig_config);
-	else
-		regmap_write(tmp108->regmap, TMP108_REG_CONF, tmp108->orig_config);
+	regmap_write(tmp108->regmap, TMP108_REG_CONF, tmp108->orig_config);
 }
 
 static bool tmp108_is_writeable_reg(struct device *dev, unsigned int reg)
@@ -405,6 +404,102 @@ static bool tmp108_is_volatile_reg(struct device *dev, unsigned int reg)
 	return reg == TMP108_REG_TEMP || reg == TMP108_REG_CONF;
 }
 
+static int tmp108_i2c_reg_read(void *context, unsigned int reg, unsigned int *val)
+{
+	struct i2c_client *client = context;
+	struct tmp108 *tmp108 = i2c_get_clientdata(client);
+	int ret;
+
+	if (reg == TMP108_REG_CONF && !tmp108->conf_reg_16bits)
+		ret = i2c_smbus_read_byte_data(client, TMP108_REG_CONF);
+	else
+		ret = i2c_smbus_read_word_swapped(client, reg);
+	if (ret < 0)
+		return ret;
+	*val = ret;
+	return 0;
+}
+
+static int tmp108_i2c_reg_write(void *context, unsigned int reg, unsigned int val)
+{
+	struct i2c_client *client = context;
+	struct tmp108 *tmp108 = i2c_get_clientdata(client);
+
+	if (reg == TMP108_REG_CONF && !tmp108->conf_reg_16bits)
+		return i2c_smbus_write_byte_data(client, reg, val);
+	return i2c_smbus_write_word_swapped(client, reg, val);
+}
+
+static const struct regmap_bus tmp108_i2c_regmap_bus = {
+	.reg_read = tmp108_i2c_reg_read,
+	.reg_write = tmp108_i2c_reg_write,
+};
+
+static int tmp108_i3c_reg_read(void *context, unsigned int reg, unsigned int *val)
+{
+	struct i3c_device *i3cdev = context;
+	struct tmp108 *tmp108 = i3cdev_get_drvdata(i3cdev);
+	struct i3c_xfer xfers[] = {
+		{
+			.rnw = false,
+			.len = 1,
+			.data.out = tmp108->reg_buf,
+		},
+		{
+			.rnw = true,
+			.len = 2,
+			.data.in = tmp108->val_buf,
+		},
+	};
+	int ret;
+
+	tmp108->reg_buf[0] = reg;
+
+	if (reg == TMP108_REG_CONF && !tmp108->conf_reg_16bits)
+		xfers[1].len--;
+
+	ret = i3c_device_do_xfers(i3cdev, xfers, 2, I3C_SDR);
+	if (ret < 0)
+		return ret;
+
+	if (reg == TMP108_REG_CONF && !tmp108->conf_reg_16bits)
+		*val = tmp108->val_buf[0];
+	else
+		*val = tmp108->val_buf[1] | (tmp108->val_buf[0] << 8);
+
+	return 0;
+}
+
+static int tmp108_i3c_reg_write(void *context, unsigned int reg, unsigned int val)
+{
+	struct i3c_device *i3cdev = context;
+	struct tmp108 *tmp108 = i3cdev_get_drvdata(i3cdev);
+	struct i3c_xfer xfers[] = {
+		{
+			.rnw = false,
+			.len = 3,
+			.data.out = tmp108->val_buf,
+		},
+	};
+
+	tmp108->val_buf[0] = reg;
+
+	if (reg == TMP108_REG_CONF && !tmp108->conf_reg_16bits) {
+		xfers[0].len--;
+		tmp108->val_buf[1] = val & 0xff;
+	} else {
+		tmp108->val_buf[1] = (val >> 8) & 0xff;
+		tmp108->val_buf[2] = val & 0xff;
+	}
+
+	return i3c_device_do_xfers(i3cdev, xfers, 1, I3C_SDR);
+}
+
+static const struct regmap_bus tmp108_i3c_regmap_bus = {
+	.reg_read = tmp108_i3c_reg_read,
+	.reg_write = tmp108_i3c_reg_write,
+};
+
 static const struct regmap_config tmp108_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 16,
@@ -417,20 +512,8 @@ static const struct regmap_config tmp108_regmap_config = {
 	.use_single_write = true,
 };
 
-static const struct regmap_config p3t1035_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = TMP108_REG_CONF,
-	.writeable_reg = tmp108_is_writeable_reg,
-	.volatile_reg = tmp108_is_volatile_reg,
-	.val_format_endian = REGMAP_ENDIAN_BIG,
-	.cache_type = REGCACHE_MAPLE,
-	.use_single_read = true,
-	.use_single_write = true,
-};
-
-static int tmp108_common_probe(struct device *dev, struct regmap *regmap, struct regmap *regmap_8,
-			       char *name, enum tmp108_hw_id hw_id)
+static int tmp108_common_probe(struct device *dev, struct regmap *regmap, char *name,
+			       enum tmp108_hw_id hw_id)
 {
 	const struct hwmon_chip_info *chip_info;
 	struct device *hwmon_dev;
@@ -450,14 +533,14 @@ static int tmp108_common_probe(struct device *dev, struct regmap *regmap, struct
 	tmp108->regmap = regmap;
 	tmp108->hw_id = hw_id;
 	if (hw_id == P3T1035_ID)
-		tmp108->regmap_8 = regmap_8;
+		tmp108->conf_reg_16bits = false;
 	else
-		tmp108->regmap_8 = NULL;
+		tmp108->conf_reg_16bits = false;
 
 	tmp108->ready_time = jiffies;
 
 	if (tmp108->hw_id == P3T1035_ID) {
-		err = regmap_read(tmp108->regmap_8, TMP108_REG_CONF, &config);
+		err = regmap_read(tmp108->regmap, TMP108_REG_CONF, &config);
 		if (err < 0) {
 			dev_err_probe(dev, err, "Error reading config register");
 			return err;
@@ -471,7 +554,7 @@ static int tmp108_common_probe(struct device *dev, struct regmap *regmap, struct
 		/* Latch control is not supported. */
 		config &= ~P3T1035_CONF_LC;
 
-		err = regmap_write(tmp108->regmap_8, TMP108_REG_CONF, config);
+		err = regmap_write(tmp108->regmap, TMP108_REG_CONF, config);
 		if (err < 0) {
 			dev_err_probe(dev, err, "Error writing config register");
 			return err;
@@ -518,16 +601,16 @@ static int tmp108_common_probe(struct device *dev, struct regmap *regmap, struct
 static int tmp108_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
-	struct regmap *regmap, *regmap_8;
+	struct regmap *regmap;
 	enum tmp108_hw_id hw_id;
 	const void *of_data;
 
 	if (!i2c_check_functionality(client->adapter,
-				     I2C_FUNC_SMBUS_WORD_DATA))
-		return dev_err_probe(dev, -ENODEV,
+				     I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA))
+		return dev_err_probe(dev, -EOPNOTSUPP,
 				     "adapter doesn't support SMBus word transactions\n");
 
-	regmap = devm_regmap_init_i2c(client, &tmp108_regmap_config);
+	regmap = devm_regmap_init(dev, &tmp108_i2c_regmap_bus, client, &tmp108_regmap_config);
 	if (IS_ERR(regmap))
 		return dev_err_probe(dev, PTR_ERR(regmap), "regmap init failed");
 
@@ -546,27 +629,15 @@ static int tmp108_probe(struct i2c_client *client)
 		hw_id = (enum tmp108_hw_id)id->driver_data;
 	}
 
-	if (hw_id == P3T1035_ID) {
-		regmap_8 = devm_regmap_init_i2c(client, &p3t1035_regmap_config);
-		if (IS_ERR(regmap_8))
-			return dev_err_probe(dev, PTR_ERR(regmap_8), "regmap_8 init failed");
-	} else {
-		regmap_8 = NULL;
-	}
-
-	return tmp108_common_probe(dev, regmap, regmap_8, client->name, hw_id);
+	return tmp108_common_probe(dev, regmap, client->name, hw_id);
 }
 
 static int tmp108_suspend(struct device *dev)
 {
 	struct tmp108 *tmp108 = dev_get_drvdata(dev);
 
-	if (tmp108->hw_id == P3T1035_ID)
-		return regmap_update_bits(tmp108->regmap_8, TMP108_REG_CONF,
-					  P3T1035_CONF_MODE_MASK, P3T1035_MODE_SHUTDOWN);
-	else
-		return regmap_update_bits(tmp108->regmap, TMP108_REG_CONF,
-					  TMP108_CONF_MODE_MASK, TMP108_MODE_SHUTDOWN);
+	return regmap_update_bits(tmp108->regmap, TMP108_REG_CONF,
+				  TMP108_CONF_MODE_MASK, TMP108_MODE_SHUTDOWN);
 }
 
 static int tmp108_resume(struct device *dev)
@@ -574,12 +645,8 @@ static int tmp108_resume(struct device *dev)
 	struct tmp108 *tmp108 = dev_get_drvdata(dev);
 	int err;
 
-	if (tmp108->hw_id == P3T1035_ID)
-		err = regmap_update_bits(tmp108->regmap_8, TMP108_REG_CONF,
-					 P3T1035_CONF_MODE_MASK, P3T1035_MODE_CONTINUOUS);
-	else
-		err = regmap_update_bits(tmp108->regmap, TMP108_REG_CONF,
-					 TMP108_CONF_MODE_MASK, TMP108_MODE_CONTINUOUS);
+	err = regmap_update_bits(tmp108->regmap, TMP108_REG_CONF,
+				 TMP108_CONF_MODE_MASK, TMP108_MODE_CONTINUOUS);
 	tmp108->ready_time = jiffies +
 			     msecs_to_jiffies(TMP108_CONVERSION_TIME_MS);
 	return err;
@@ -625,11 +692,11 @@ MODULE_DEVICE_TABLE(i3c, p3t1085_i3c_ids);
 static int p3t1085_i3c_probe(struct i3c_device *i3cdev)
 {
 	struct device *dev = i3cdev_to_dev(i3cdev);
-	struct regmap *regmap, *regmap_8;
+	struct regmap *regmap;
 	const struct i3c_device_id *id;
 	enum tmp108_hw_id hw_id;
 
-	regmap = devm_regmap_init_i3c(i3cdev, &tmp108_regmap_config);
+	regmap = devm_regmap_init(dev, &tmp108_i3c_regmap_bus, i3cdev, &tmp108_regmap_config);
 	if (IS_ERR(regmap))
 		return dev_err_probe(dev, PTR_ERR(regmap),
 				     "Failed to register i3c regmap\n");
@@ -641,16 +708,7 @@ static int p3t1085_i3c_probe(struct i3c_device *i3cdev)
 	}
 	hw_id = (enum tmp108_hw_id)(uintptr_t)id->data;
 
-	if (hw_id == P3T1035_ID) {
-		regmap_8 = devm_regmap_init_i3c(i3cdev, &p3t1035_regmap_config);
-		if (IS_ERR(regmap_8))
-			return dev_err_probe(dev, PTR_ERR(regmap_8),
-					     "Failed to register i3c regmap_8\n");
-	} else {
-		regmap_8 = NULL;
-	}
-
-	return tmp108_common_probe(dev, regmap, regmap_8, "p3t1085_i3c", hw_id);
+	return tmp108_common_probe(dev, regmap, "p3t1085_i3c", hw_id);
 }
 
 static struct i3c_driver p3t1085_driver = {
