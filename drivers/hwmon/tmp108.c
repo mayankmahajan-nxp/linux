@@ -434,6 +434,8 @@ static const struct regmap_config tmp108_regmap_config = {
 static int tmp108_common_probe(struct device *dev, struct regmap *regmap, char *name,
 			       enum tmp108_hw_id hw_id)
 {
+	static const unsigned int p3t1035_sample_times[] = {125, 250, 1000, 4000};
+	static const unsigned int tmp108_sample_times[] = {63, 250, 1000, 4000};
 	struct device *hwmon_dev;
 	struct tmp108 *tmp108;
 	u32 config;
@@ -452,11 +454,9 @@ static int tmp108_common_probe(struct device *dev, struct regmap *regmap, char *
 	tmp108->hw_id = hw_id;
 	tmp108->config_reg_16bits = (hw_id == P3T1035_ID) ? false : true;
 	if (hw_id == P3T1035_ID)
-		memcpy(tmp108->sample_times, (unsigned int[]){ 125, 250, 1000, 4000 },
-		       sizeof(tmp108->sample_times));
+		memcpy(tmp108->sample_times, p3t1035_sample_times, sizeof(p3t1035_sample_times));
 	else
-		memcpy(tmp108->sample_times, (unsigned int[]){ 63, 250, 1000, 4000 },
-		       sizeof(tmp108->sample_times));
+		memcpy(tmp108->sample_times, tmp108_sample_times, sizeof(tmp108_sample_times));
 
 	err = regmap_read(tmp108->regmap, TMP108_REG_CONF, &config);
 	if (err < 0) {
