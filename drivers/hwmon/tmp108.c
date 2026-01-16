@@ -78,21 +78,22 @@ enum tmp108_hw_id {
 
 #define TMP108_CONVERSION_TIME_MS	30	/* in milli-seconds */
 
+#define TMP108_CONF_CR0_POS		13
+#define TMP108_CONF_CR1_POS		14
+#define TMP108_CONF_CONVRATE_FLD	GENMASK(TMP108_CONF_CR1_POS, TMP108_CONF_CR0_POS)
+
 struct tmp108 {
 	struct regmap		*regmap;
 	u16			orig_config;
 	unsigned long		ready_time;
 	enum tmp108_hw_id	hw_id;
 	bool			config_reg_16bits;
-	u8			reg_buf[1];
-	u8			val_buf[3];
-	unsigned int		sample_times[4];
+	ushort			*sample_times;
+	size_t			n_sample_times;
 };
 
-static const u16 tmp108_sample_set_masks[] = { 3 << TMP108_CONVRATE_SHIFT,
-					       2 << TMP108_CONVRATE_SHIFT,
-					       1 << TMP108_CONVRATE_SHIFT,
-					       0 << TMP108_CONVRATE_SHIFT };
+ushort p3t1035_sample_times[] = {4000, 1000, 250, 125};
+ushort tmp108_sample_times[] = {4000, 1000, 250, 63};
 
 /* convert 12-bit TMP108 register value to milliCelsius */
 static inline int tmp108_temp_reg_to_mC(s16 val)
@@ -112,8 +113,6 @@ static int tmp108_read(struct device *dev, enum hwmon_sensor_types type,
 	struct tmp108 *tmp108 = dev_get_drvdata(dev);
 	unsigned int regval;
 	int err, hyst;
-	u16 conv_rate;
-	u8 index;
 
 	if (type == hwmon_chip) {
 		if (attr == hwmon_chip_update_interval) {
@@ -121,10 +120,7 @@ static int tmp108_read(struct device *dev, enum hwmon_sensor_types type,
 					  &regval);
 			if (err < 0)
 				return err;
-			conv_rate = regval & TMP108_CONF_CONVRATE_MASK;
-			index = find_closest_descending(conv_rate, tmp108_sample_set_masks,
-							(int)ARRAY_SIZE(tmp108_sample_set_masks));
-			*temp = tmp108->sample_times[index];
+			*temp = tmp108->sample_times[FIELD_GET(TMP108_CONF_CONVRATE_FLD, regval)];
 			return 0;
 		}
 		return -EOPNOTSUPP;
@@ -206,12 +202,12 @@ static int tmp108_write(struct device *dev, enum hwmon_sensor_types type,
 
 	if (type == hwmon_chip) {
 		if (attr == hwmon_chip_update_interval) {
-			index = find_closest(temp, tmp108->sample_times,
-					     (int)ARRAY_SIZE(tmp108->sample_times));
+			index = find_closest_descending(temp, tmp108->sample_times,
+							tmp108->n_sample_times);
 			return regmap_update_bits(tmp108->regmap,
 						  TMP108_REG_CONF,
 						  TMP108_CONF_CONVRATE_MASK,
-						  tmp108_sample_set_masks[index]);
+						  FIELD_PREP(TMP108_CONF_CONVRATE_FLD, index));
 		}
 		return -EOPNOTSUPP;
 	}
@@ -326,19 +322,18 @@ static int tmp108_i2c_reg_read(void *context, unsigned int reg, unsigned int *va
 	struct tmp108 *tmp108 = i2c_get_clientdata(client);
 	int ret;
 
-	if (reg == TMP108_REG_CONF && !tmp108->config_reg_16bits)
+	if (reg == TMP108_REG_CONF && !tmp108->config_reg_16bits) {
 		ret = i2c_smbus_read_byte_data(client, TMP108_REG_CONF);
-	else
-		ret = i2c_smbus_read_word_swapped(client, reg);
+		if (ret < 0)
+			return ret;
+		*val = ret << 8;
+		return 0;
+	}
 
+	ret = i2c_smbus_read_word_swapped(client, reg);
 	if (ret < 0)
 		return ret;
-
-	if (reg == TMP108_REG_CONF && !tmp108->config_reg_16bits)
-		*val = ret << 8;
-	else
-		*val = ret;
-
+	*val = ret;
 	return 0;
 }
 
@@ -361,21 +356,22 @@ static int tmp108_i3c_reg_read(void *context, unsigned int reg, unsigned int *va
 {
 	struct i3c_device *i3cdev = context;
 	struct tmp108 *tmp108 = i3cdev_get_drvdata(i3cdev);
+	u8 reg_buf[1], val_buf[2];
 	struct i3c_xfer xfers[] = {
 		{
 			.rnw = false,
 			.len = 1,
-			.data.out = tmp108->reg_buf,
+			.data.out = reg_buf,
 		},
 		{
 			.rnw = true,
 			.len = 2,
-			.data.in = tmp108->val_buf,
+			.data.in = val_buf,
 		},
 	};
 	int ret;
 
-	tmp108->reg_buf[0] = reg;
+	reg_buf[0] = reg;
 
 	if (reg == TMP108_REG_CONF && !tmp108->config_reg_16bits)
 		xfers[1].len--;
@@ -384,9 +380,9 @@ static int tmp108_i3c_reg_read(void *context, unsigned int reg, unsigned int *va
 	if (ret < 0)
 		return ret;
 
-	*val = tmp108->val_buf[0] << 8;
-	if (!(reg == TMP108_REG_CONF && !tmp108->config_reg_16bits))
-		*val |= tmp108->val_buf[1];
+	*val = val_buf[0] << 8;
+	if (reg != TMP108_REG_CONF || tmp108->config_reg_16bits)
+		*val |= val_buf[1];
 
 	return 0;
 }
@@ -395,21 +391,22 @@ static int tmp108_i3c_reg_write(void *context, unsigned int reg, unsigned int va
 {
 	struct i3c_device *i3cdev = context;
 	struct tmp108 *tmp108 = i3cdev_get_drvdata(i3cdev);
+	u8 val_buf[3];
 	struct i3c_xfer xfers[] = {
 		{
 			.rnw = false,
 			.len = 3,
-			.data.out = tmp108->val_buf,
+			.data.out = val_buf,
 		},
 	};
 
-	tmp108->val_buf[0] = reg;
-	tmp108->val_buf[1] = (val >> 8) & 0xff;
+	val_buf[0] = reg;
+	val_buf[1] = (val >> 8) & 0xff;
 
 	if (reg == TMP108_REG_CONF && !tmp108->config_reg_16bits)
 		xfers[0].len--;
 	else
-		tmp108->val_buf[2] = val & 0xff;
+		val_buf[2] = val & 0xff;
 
 	return i3c_device_do_xfers(i3cdev, xfers, 1, I3C_SDR);
 }
@@ -434,8 +431,6 @@ static const struct regmap_config tmp108_regmap_config = {
 static int tmp108_common_probe(struct device *dev, struct regmap *regmap, char *name,
 			       enum tmp108_hw_id hw_id)
 {
-	static const unsigned int p3t1035_sample_times[] = {125, 250, 1000, 4000};
-	static const unsigned int tmp108_sample_times[] = {63, 250, 1000, 4000};
 	struct device *hwmon_dev;
 	struct tmp108 *tmp108;
 	u32 config;
@@ -453,10 +448,13 @@ static int tmp108_common_probe(struct device *dev, struct regmap *regmap, char *
 	tmp108->regmap = regmap;
 	tmp108->hw_id = hw_id;
 	tmp108->config_reg_16bits = (hw_id == P3T1035_ID) ? false : true;
-	if (hw_id == P3T1035_ID)
-		memcpy(tmp108->sample_times, p3t1035_sample_times, sizeof(p3t1035_sample_times));
-	else
-		memcpy(tmp108->sample_times, tmp108_sample_times, sizeof(tmp108_sample_times));
+	if (hw_id == P3T1035_ID) {
+		tmp108->sample_times = p3t1035_sample_times;
+		tmp108->n_sample_times = ARRAY_SIZE(p3t1035_sample_times);
+	} else {
+		tmp108->sample_times = tmp108_sample_times;
+		tmp108->n_sample_times = ARRAY_SIZE(tmp108_sample_times);
+	}
 
 	err = regmap_read(tmp108->regmap, TMP108_REG_CONF, &config);
 	if (err < 0) {
@@ -501,7 +499,6 @@ static int tmp108_probe(struct i2c_client *client)
 	struct device *dev = &client->dev;
 	struct regmap *regmap;
 	enum tmp108_hw_id hw_id;
-	const void *of_data;
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA))
@@ -512,19 +509,7 @@ static int tmp108_probe(struct i2c_client *client)
 	if (IS_ERR(regmap))
 		return dev_err_probe(dev, PTR_ERR(regmap), "regmap init failed");
 
-	/* Prefer OF match data (DT-first systems) */
-	of_data = device_get_match_data(&client->dev);
-	if (of_data) {
-		hw_id = (unsigned long)of_data;
-	} else {
-		/* Fall back to legacy I2C ID table */
-		const struct i2c_device_id *id = i2c_client_get_device_id(client);
-
-		if (!id) {
-			return dev_err_probe(dev, -ENODEV, "No matching device ID for i2c device\n");
-		}
-		hw_id = (unsigned long)id->driver_data;
-	}
+	hw_id = (unsigned long)i2c_get_match_data(client);
 
 	return tmp108_common_probe(dev, regmap, client->name, hw_id);
 }
@@ -555,7 +540,7 @@ static const struct i2c_device_id tmp108_i2c_ids[] = {
 	{ "p3t1035", P3T1035_ID },
 	{ "p3t1085", P3T1085_ID },
 	{ "tmp108", TMP108_ID },
-	{ /* sentinel */ },
+	{}
 };
 MODULE_DEVICE_TABLE(i2c, tmp108_i2c_ids);
 
@@ -563,7 +548,7 @@ static const struct of_device_id tmp108_of_ids[] = {
 	{ .compatible = "nxp,p3t1035", .data = (void *)(uintptr_t)P3T1035_ID },
 	{ .compatible = "nxp,p3t1085", .data = (void *)(uintptr_t)P3T1085_ID },
 	{ .compatible = "ti,tmp108", .data = (void *)(uintptr_t)TMP108_ID },
-	{ /* sentinel */ },
+	{}
 };
 MODULE_DEVICE_TABLE(of, tmp108_of_ids);
 
@@ -580,7 +565,7 @@ static struct i2c_driver tmp108_driver = {
 static const struct i3c_device_id p3t1085_i3c_ids[] = {
 	I3C_DEVICE(0x011B, 0x1529, (void *)P3T1085_ID),
 	I3C_DEVICE(0x011B, 0x152B, (void *)P3T1035_ID),
-	{ /* sentinel */ },
+	{}
 };
 MODULE_DEVICE_TABLE(i3c, p3t1085_i3c_ids);
 
@@ -589,7 +574,6 @@ static int p3t1085_i3c_probe(struct i3c_device *i3cdev)
 	struct device *dev = i3cdev_to_dev(i3cdev);
 	struct regmap *regmap;
 	const struct i3c_device_id *id;
-	enum tmp108_hw_id hw_id;
 
 	regmap = devm_regmap_init(dev, &tmp108_i3c_regmap_bus, i3cdev, &tmp108_regmap_config);
 	if (IS_ERR(regmap))
@@ -597,12 +581,8 @@ static int p3t1085_i3c_probe(struct i3c_device *i3cdev)
 				     "Failed to register i3c regmap\n");
 
 	id = i3c_device_match_id(i3cdev, p3t1085_i3c_ids);
-	if (!id) {
-		return dev_err_probe(dev, -ENODEV, "No matching device ID for i3c device\n");
-	}
-	hw_id = (enum tmp108_hw_id)(uintptr_t)id->data;
 
-	return tmp108_common_probe(dev, regmap, "p3t1085_i3c", hw_id);
+	return tmp108_common_probe(dev, regmap, "p3t1085_i3c", (unsigned long)id->data);
 }
 
 static struct i3c_driver p3t1085_driver = {
